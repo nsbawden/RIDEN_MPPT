@@ -1,7 +1,6 @@
 # install_mppt_tasks.ps1
 # Creates:
-#  - RIDEN_MPPT_BG (Daily 8:00 AM, WakeToRun, runs riden_mppt.py in background with --bg)
-#  - RIDEN_MPPT_STOP_ON_LOGON (At logon, kills ONLY the --bg instance so you can run it interactively)
+#  - RIDEN_MPPT_BG (Daily 7:45 AM, WakeToRun, runs riden_mppt.py in background with --bg)
 
 $ErrorActionPreference = "Stop" # fail fast on script errors
 
@@ -20,7 +19,7 @@ if (-not (Test-IsAdmin)) {
 }
 
 $TaskBg = "RIDEN_MPPT_BG" # task name
-$TaskKill = "RIDEN_MPPT_STOP_ON_LOGON" # task name
+$TaskKill = "RIDEN_MPPT_STOP_ON_LOGON" # legacy task name (we remove it if present)
 
 $MpptDir = "C:/Users/Quant/Python/MPPT" # working directory
 $ScriptPath = "$MpptDir/riden_mppt.py" # script path
@@ -55,32 +54,26 @@ try {
 
     $PyExe = Get-PythonExePath # resolve python.exe full path
 
+    # Remove legacy kill-on-logon task if it exists
+    try {
+        if (Get-ScheduledTask -TaskName $TaskKill -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName $TaskKill -Confirm:$false # remove legacy task
+        }
+    }
+    catch {
+        Write-Host ("ERR remove legacy task: " + $_.Exception.Message) # errors only
+    }
+
     # ----- Background task -----
     $ArgsBg = "`"$ScriptPath`" $TargetVin $ComPort $SlaveId --bg" # tag background instance with --bg
     $ActionBg = New-ScheduledTaskAction -Execute $PyExe -Argument $ArgsBg -WorkingDirectory $MpptDir # background action
-    $TriggerBg = New-ScheduledTaskTrigger -Daily -At 8:00AM # 8am daily trigger
+    $TriggerBg = New-ScheduledTaskTrigger -Daily -At 7:45AM # daily trigger
     $SettingsBg = New-ScheduledTaskSettingsSet -WakeToRun -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries # wake and run on battery
 
     # Run as your user (interactive token not required; still runs in background)
     $PrincipalBg = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U -RunLevel Limited # no admin required
 
     Register-ScheduledTask -TaskName $TaskBg -Action $ActionBg -Trigger $TriggerBg -Settings $SettingsBg -Principal $PrincipalBg -Force | Out-Null # create/replace task
-
-    # ----- Kill-on-logon task -----
-    $KillCmd = @'
-Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-Where-Object { $_.CommandLine -like "*riden_mppt.py*--bg*" } |
-ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
-'@ # kill only the tagged background instance
-
-    $KillEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($KillCmd)) # base64 for -EncodedCommand
-    $ActionKill = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -EncodedCommand $KillEncoded" # kill action
-    $TriggerKill = New-ScheduledTaskTrigger -AtLogOn # when you log in
-    $SettingsKill = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries # run regardless of power state
-
-    $PrincipalKill = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited # run in your user session
-
-    Register-ScheduledTask -TaskName $TaskKill -Action $ActionKill -Trigger $TriggerKill -Settings $SettingsKill -Principal $PrincipalKill -Force | Out-Null # create/replace task
 }
 catch {
     Write-Host ("ERR install tasks: " + $_.Exception.Message) # errors only

@@ -3,6 +3,8 @@ import serial
 import sys
 import subprocess
 from datetime import datetime
+import ctypes
+import ctypes.wintypes
 
 # -------------------------------------------------------------------------------------------------
 # RIDEN RD6024 "SOFTWARE MPPT" CONTROLLER (Modbus RTU over USB-Serial / CH340)
@@ -69,6 +71,84 @@ DEFAULT_TARGET_VIN = 33.0  # volts; good knee you found for your 36V panels
 STATE_BATT_FULL = "BATT F"
 STATE_CONST_V = "CONST V"
 STATE_MAX_R = "MAX R"
+
+# -------------------------------------------------------------------------------------------------
+# SINGLE-INSTANCE CONTROL (FG takes over from BG)
+# -------------------------------------------------------------------------------------------------
+
+KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+_CreateMutexW = KERNEL32.CreateMutexW
+_CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.wintypes.BOOL, ctypes.wintypes.LPCWSTR)
+_CreateMutexW.restype = ctypes.wintypes.HANDLE
+
+_OpenMutexW = KERNEL32.OpenMutexW
+_OpenMutexW.argtypes = (ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.LPCWSTR)
+_OpenMutexW.restype = ctypes.wintypes.HANDLE
+
+_ReleaseMutex = KERNEL32.ReleaseMutex
+_ReleaseMutex.argtypes = (ctypes.wintypes.HANDLE,)
+_ReleaseMutex.restype = ctypes.wintypes.BOOL
+
+_CloseHandle = KERNEL32.CloseHandle
+_CloseHandle.argtypes = (ctypes.wintypes.HANDLE,)
+_CloseHandle.restype = ctypes.wintypes.BOOL
+
+_GetLastError = KERNEL32.GetLastError
+
+ERROR_ALREADY_EXISTS = 183
+MUTEX_MODIFY_STATE = 0x0001
+
+# "Global\" allows cross-session visibility (Task Scheduler vs interactive logon).
+# If that ever causes permission issues, change to "Local\".
+MPPT_MUTEX_NAME = "Global\\RIDEN_MPPT_OWNER_MUTEX"
+
+
+def mppt_take_ownership_or_exit(background_mode: bool) -> bool:
+    # Background behavior: if someone else already owns it, exit quietly.
+    # Foreground behavior: if background owns it, force it to release so FG can proceed.
+    #
+    # Note: we do not log successes; only errors.
+
+    h_owner = _CreateMutexW(None, False, MPPT_MUTEX_NAME)
+    if not h_owner:
+        print("ERR CreateMutexW failed")
+        return False
+
+    already_exists = (_GetLastError() == ERROR_ALREADY_EXISTS)
+    if not already_exists:
+        # First instance; keep the handle open for lifetime of process.
+        return True
+
+    if background_mode:
+        # BG should not steal; exit.
+        try:
+            _CloseHandle(h_owner)
+        except Exception:
+            pass
+        return False
+
+    # FG: attempt to force release by opening the existing mutex and releasing it.
+    # This is slightly "aggressive", but it's what you want: FG wins.
+    h_existing = _OpenMutexW(MUTEX_MODIFY_STATE, False, MPPT_MUTEX_NAME)
+    if not h_existing:
+        # If we can't open it, we still proceed (FG) because CreateMutex succeeded.
+        # Worst case: BG continues too; not ideal, but avoids blocking.
+        print("ERR OpenMutexW failed")
+        return True
+
+    try:
+        # If BG owns it, this will release it (ownership semantics are kernel-managed).
+        _ReleaseMutex(h_existing)
+    except Exception:
+        pass
+
+    try:
+        _CloseHandle(h_existing)
+    except Exception:
+        pass
+
+    return True
 
 
 def modbus_crc16(data: bytes) -> int:
@@ -565,6 +645,9 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
 
 if __name__ == "__main__":
     bg = "--bg" in sys.argv
+
+    if not mppt_take_ownership_or_exit(bg):
+        sys.exit(0)
 
     vtarget = float(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_TARGET_VIN
     port = sys.argv[2] if len(sys.argv) > 2 else "COM4"

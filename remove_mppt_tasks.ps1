@@ -1,7 +1,6 @@
 # remove_mppt_tasks.ps1
 # Removes:
 #  - RIDEN_MPPT_BG
-#  - RIDEN_MPPT_STOP_ON_LOGON
 
 $ErrorActionPreference = "Stop" # fail fast on script errors
 
@@ -20,15 +19,16 @@ if (-not (Test-IsAdmin)) {
 }
 
 $TaskBg = "RIDEN_MPPT_BG" # task name
-$TaskKill = "RIDEN_MPPT_STOP_ON_LOGON" # task name
+$TaskKill = "RIDEN_MPPT_STOP_ON_LOGON" # legacy task name (remove if present)
 
 try {
     if (Get-ScheduledTask -TaskName $TaskBg -ErrorAction SilentlyContinue) {
         Unregister-ScheduledTask -TaskName $TaskBg -Confirm:$false # remove background task
     }
 
+    # Remove legacy kill-on-logon task if it exists (cleanup)
     if (Get-ScheduledTask -TaskName $TaskKill -ErrorAction SilentlyContinue) {
-        Unregister-ScheduledTask -TaskName $TaskKill -Confirm:$false # remove kill-on-logon task
+        Unregister-ScheduledTask -TaskName $TaskKill -Confirm:$false # remove legacy task
     }
 }
 catch {
