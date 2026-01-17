@@ -2,6 +2,7 @@ import time
 import serial
 import sys
 import subprocess
+import os
 from datetime import datetime
 import ctypes
 import ctypes.wintypes
@@ -346,6 +347,95 @@ def _shutdown_windows_now() -> None:
     subprocess.run(["shutdown", "/h"], check=False)
 
 
+# -------------------------------------------------------------------------------------------------
+# CSV LOGGING (single definition point)
+# -------------------------------------------------------------------------------------------------
+
+def _csv_escape(s: str) -> str:
+    if s is None:
+        return ""
+    if any(c in s for c in [",", "\"", "\n", "\r"]):
+        return "\"" + s.replace("\"", "\"\"") + "\""
+    return s
+
+
+def _log_file_name(now: datetime) -> str:
+    # MPPT_LOG_YYYY_MM_DD.csv
+    return f"MPPT_LOG_{now.year:04d}_{now.month:02d}_{now.day:02d}.csv"
+
+
+# Edit the log by changing ONLY this list (fields) and the mapping in _log_get_value().
+LOG_FIELDS = [
+    "ts_local",
+    "bg",
+    "port",
+    "slave",
+    "target_vin",
+    "status",
+    "mode_is_constv",
+    "band",
+    "step_used",
+    "vin",
+    "vset",
+    "outv",
+    "iout",
+    "pout",
+    "iset_read",
+    "iset_cmd",
+    "new_iset",
+    "iceil",
+    "err_vin",
+    "abs_err_vin",
+    "vset_base",
+    "vset_reduced",
+    "extra_1",
+    "extra_2",
+    "extra_3",
+]
+
+
+def _log_get_value(field: str, ctx: dict) -> str:
+    # Single mapping point for all fields. Add/remove fields here only.
+    # ctx contains only current "in use" values.
+    v = ctx.get(field, "")
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return f"{v:.2f}"
+    return str(v)
+
+
+def _log_write_if_due(last_log_t: float, log_delay_s: float, ctx: dict) -> float:
+    # One place that:
+    #  - chooses daily file name
+    #  - writes header if needed
+    #  - writes one row
+    if (time.time() - last_log_t) < log_delay_s:
+        return last_log_t
+
+    now = datetime.now()
+    path = _log_file_name(now)
+
+    try:
+        need_header = (not os.path.exists(path)) or (os.path.getsize(path) == 0)
+    except Exception:
+        need_header = True
+
+    try:
+        with open(path, "a", encoding="utf-8", newline="") as f:
+            if need_header:
+                f.write(",".join(_csv_escape(x) for x in LOG_FIELDS) + "\n")
+            row = [_log_get_value(k, ctx) for k in LOG_FIELDS]
+            f.write(",".join(_csv_escape(x) for x in row) + "\n")
+            f.flush()
+    except Exception as e:
+        print(f"ERR log write: {e}")
+
+    return time.time()
+
+
 def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> None:
     # ---------------------------------------------------------------------------------------------
     # CONSTANT-PV-VOLTAGE CONTROL LOOP (cloud-resistant "software MPPT")
@@ -355,9 +445,9 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
     SHUTDOWN_WATTS = 15.0     # approx laptop draw threshold
     SHUTDOWN_HOLD_S = 300     # seconds below threshold before shutdown (5 min)
 
-    VSET_DROP_FULL = 0.30  # volts to reduce VSET when in BATT F state
+    VSET_DROP_BATT_FULL = 0.30  # volts to reduce VSET when in BATT F state
 
-    VIN_BAND = 0.05  # volts; deadband around target to avoid constant chatter
+    VIN_BAND = 0.00  # volts; deadband around target to avoid constant chatter
     HARD_DROP = 5.0  # volts; collapse trigger (VIN far below target => emergency backoff)
 
     I_MIN = 0.01
@@ -365,8 +455,9 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
     I_OVER = 0.5  # how much ISET can exceed IOUT
     I_UNATTENDED = 15.0  # Best amps for RIDEN to use if MPPT controller is inactive (laptop off)
 
-    LOOP_DELAY = 0.5
-    FAST_DELAY = 0.2
+    LOOP_DELAY = 0.5  # seconds
+    FAST_DELAY = 0.2  # seconds
+    LOG_DELAY = 5.0   # seconds
 
     STARTUP_DELAY_S = 8.0  # background wake: give USB/CH340 time to enumerate
 
@@ -381,27 +472,29 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
 
     HUGE_STEP_UP = 1.75
     HUGE_STEP_DN = 1.75
-    FAR_STEP_UP = 0.20
-    FAR_STEP_DN = 0.20
-    MID_STEP_UP = 0.075
-    MID_STEP_DN = 0.075
-    NEAR_STEP_UP = 0.05
-    NEAR_STEP_DN = 0.05
+    FAR_STEP_UP = 0.10
+    FAR_STEP_DN = 0.10
+    MID_STEP_UP = 0.06
+    MID_STEP_DN = 0.06
+    NEAR_STEP_UP = 0.03
+    NEAR_STEP_DN = 0.03
     FINE_STEP_UP = 0.01
     FINE_STEP_DN = 0.01
 
     # -------------------------------------------------------------------------------------------------
     # CHARGE/MODE DETECTION (with hysteresis so mode does not flap on 0.01-0.03V noise)
     # -------------------------------------------------------------------------------------------------
-    FULL_I = 3.5  # Current out when battery is full
+    FULL_I = 4.00  # Current out when battery is full (laptop etc. loads)
 
-    CONSTV_ENTER_EPS = 0.05  # enter CONST V when OUTV >= VSET - 0.03
-    CONSTV_EXIT_EPS = 0.08   # exit CONST V only when OUTV <= VSET - 0.08
+    CONSTV_ENTER_EPS = 0.05  # enter CONST V when OUTV >= VSET - 0.CONSTV_ENTER_EPS
+    CONSTV_EXIT_EPS = 0.1   # exit CONST V only when OUTV <= VSET - CONSTV_EXIT_EPS
 
     mode_is_constv = False  # sticky state
 
     if background_mode:
         time.sleep(STARTUP_DELAY_S)
+
+    last_log_t = 0.0
 
     with serial.Serial(port, 115200, timeout=0.05, write_timeout=0.25) as ser:
         # Capture RIDEN starting state and restore on exit (Ctrl-C / exceptions included).
@@ -439,10 +532,6 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                 except Exception as e:
                     print(f"ERR read_status: {e}")
                     time.sleep(0.5)
-                    continue
-
-                if not on:
-                    time.sleep(1.0)
                     continue
 
                 if vset_base is None:
@@ -485,9 +574,20 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                         _shutdown_windows_now()
                         return
 
+                # Defaults for "current in use" logging.
+                band = ""
+                step_used = 0.0
+                new_iset = float(iset_cmd)
+                iceil = _quant_amps(clamp(iout + I_OVER, I_MIN, I_MAX))
+                err_vin = vin - target_vin
+                abs_err_vin = -err_vin if err_vin < 0.0 else err_vin
+
                 # HARD CLOUD COLLAPSE:
                 if vin < (target_vin - HARD_DROP):
+                    band = "FAST"
+                    step_used = 0.0
                     new_iset = _quant_amps(clamp(iset * 0.7, I_MIN, I_MAX))
+
                     try:
                         set_iset(ser, slave, new_iset)
                         iset_cmd = new_iset
@@ -500,7 +600,7 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                     if status_now == STATE_BATT_FULL:
                         if not vset_reduced:
                             vset_base = vset
-                            vset_full = _quant_volts(max(0.0, vset_base - VSET_DROP_FULL))
+                            vset_full = _quant_volts(max(0.0, vset_base - VSET_DROP_BATT_FULL))
                             try:
                                 set_vset(ser, slave, vset_full)
                                 vset_reduced = True
@@ -518,104 +618,140 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                             vset_base = vset
 
                     print(
-                        f"TGT={target_vin:5.2f}  "
-                        f"FAST DROP  VIN={vin:5.2f}  ISET {iset:5.2f}->{new_iset:5.2f}  "
-                        f"STAT={status_now}"
+                        f"FAST RCVR TGT={target_vin:5.2f}  "
+                        f"IOUT={iout:5.2f}A  "
+                        f"PWR={pout:5.1f}W  "
+                        f"VIN={vin:5.2f}V  "
+                        f"VIN={vin:5.2f}  ISET {iset:5.2f}->{new_iset:5.2f}  "
+                        f"{status_now}"
                     )
+
                     time.sleep(FAST_DELAY)
-                    continue
 
-                # -------------------------------------------------------------------------------------------------
-                # NORMAL CONTROL (5-level steps)
-                # -------------------------------------------------------------------------------------------------
-                err = vin - target_vin
-                abs_err = -err if err < 0.0 else err
-                iceil = _quant_amps(clamp(iout + I_OVER, I_MIN, I_MAX))
-
-                if mode_is_constv:
-                    step_up = FINE_STEP_UP
-                    step_dn = FINE_STEP_DN
-                    band = "FINE"
                 else:
-                    if abs_err > V4:
-                        step_up = HUGE_STEP_UP
-                        step_dn = HUGE_STEP_DN
-                        band = "HUGE"
-                    elif abs_err > V3:
-                        step_up = FAR_STEP_UP
-                        step_dn = FAR_STEP_DN
-                        band = "FAR "
-                    elif abs_err > V2:
-                        step_up = MID_STEP_UP
-                        step_dn = MID_STEP_DN
-                        band = "MID "
-                    elif abs_err > V1:
-                        step_up = NEAR_STEP_UP
-                        step_dn = NEAR_STEP_DN
-                        band = "NEAR"
-                    else:
+                    # -------------------------------------------------------------------------------------------------
+                    # NORMAL CONTROL (5-level steps)
+                    # -------------------------------------------------------------------------------------------------
+                    if mode_is_constv or status_now == "BATT F":
                         step_up = FINE_STEP_UP
                         step_dn = FINE_STEP_DN
                         band = "FINE"
-
-                step_up = _quant_amps(step_up)
-                step_dn = _quant_amps(step_dn)
-
-                if err > VIN_BAND:
-                    new_iset = iset_cmd + step_up
-                elif err < -VIN_BAND:
-                    new_iset = iset_cmd - step_dn
-                else:
-                    new_iset = iset_cmd
-
-                new_iset = _quant_amps(clamp(new_iset, I_MIN, I_MAX))
-
-                if new_iset > iceil:
-                    new_iset = iceil
-
-                if new_iset != iset_cmd:
-                    try:
-                        set_iset(ser, slave, new_iset)
-                        iset_cmd = new_iset
-                    except Exception as e:
-                        print(f"ERR set_iset: {e}")
-                        time.sleep(0.5)
-                        continue
-
-                # VSET DROP/RESTORE FEATURE
-                if status_now == STATE_BATT_FULL:
-                    if not vset_reduced:
-                        vset_base = vset
-                        vset_full = _quant_volts(max(0.0, vset_base - VSET_DROP_FULL))
-                        try:
-                            set_vset(ser, slave, vset_full)
-                            vset_reduced = True
-                        except Exception as e:
-                            print(f"ERR set_vset: {e}")
-                else:
-                    if vset_reduced:
-                        try:
-                            set_vset(ser, slave, _quant_volts(vset_base))
-                        except Exception as e:
-                            print(f"ERR set_vset: {e}")
-                        vset_reduced = False
-                        vset_base = vset
                     else:
-                        vset_base = vset
+                        if abs_err_vin > V4:
+                            step_up = HUGE_STEP_UP
+                            step_dn = HUGE_STEP_DN
+                            band = "HUGE"
+                        elif abs_err_vin > V3:
+                            step_up = FAR_STEP_UP
+                            step_dn = FAR_STEP_DN
+                            band = "FAR "
+                        elif abs_err_vin > V2:
+                            step_up = MID_STEP_UP
+                            step_dn = MID_STEP_DN
+                            band = "MID "
+                        elif abs_err_vin > V1:
+                            step_up = NEAR_STEP_UP
+                            step_dn = NEAR_STEP_DN
+                            band = "NEAR"
+                        else:
+                            step_up = FINE_STEP_UP
+                            step_dn = FINE_STEP_DN
+                            band = "FINE"
 
-                print(
-                    f"VSET={vset:5.2f}V "
-                    f"VOUT={outv:5.2f}V "
-                    f"IOUT={iout:5.2f}A  | "
-                    f"PWR={pout:5.1f}W  "
-                    f"VIN={vin:5.2f}  "
-                    f"ISET={iset_cmd:5.2f}  "
-                    f"STEP={step_up:2.2f}/{step_dn:2.2f}  "
-                    f"{band}  "
-                    f"{status_now}"
-                )
+                    step_up = _quant_amps(step_up)
+                    step_dn = _quant_amps(step_dn)
 
-                time.sleep(LOOP_DELAY)
+                    if err_vin > VIN_BAND:
+                        new_iset = float(iset_cmd) + step_up
+                        step_used = step_up
+                    elif err_vin < -VIN_BAND:
+                        new_iset = float(iset_cmd) - step_dn
+                        step_used = step_dn
+                    else:
+                        new_iset = float(iset_cmd)
+                        step_used = 0.0
+
+                    new_iset = _quant_amps(clamp(new_iset, I_MIN, I_MAX))
+
+                    if new_iset > iceil:
+                        new_iset = iceil
+
+                    if new_iset != iset_cmd:
+                        try:
+                            set_iset(ser, slave, new_iset)
+                            iset_cmd = new_iset
+                        except Exception as e:
+                            print(f"ERR set_iset: {e}")
+                            time.sleep(0.5)
+                            continue
+
+                    # VSET DROP/RESTORE FEATURE
+                    if status_now == STATE_BATT_FULL:
+                        if not vset_reduced:
+                            vset_base = vset
+                            vset_full = _quant_volts(max(0.0, vset_base - VSET_DROP_BATT_FULL))
+                            try:
+                                set_vset(ser, slave, vset_full)
+                                vset_reduced = True
+                            except Exception as e:
+                                print(f"ERR set_vset: {e}")
+                    else:
+                        if vset_reduced:
+                            try:
+                                set_vset(ser, slave, _quant_volts(vset_base))
+                            except Exception as e:
+                                print(f"ERR set_vset: {e}")
+                            vset_reduced = False
+                            vset_base = vset
+                        else:
+                            vset_base = vset
+
+                    print(
+                        f"VSET={vset:5.2f}V "
+                        f"VOUT={outv:5.2f}V "
+                        f"IOUT={iout:5.2f}A  | "
+                        f"PWR={pout:5.1f}W  "
+                        f"VIN={vin:5.2f}  "
+                        f"ISET={iset_cmd:5.2f}  "
+                        f"STEP={step_used:2.2f}  "
+                        f"{band}  "
+                        f"{status_now}"
+                    )
+
+                    time.sleep(LOOP_DELAY)
+
+                # -------------------------------------------------------------------------------------------------
+                # LOGGING (ONE PLACE: end of loop)
+                # -------------------------------------------------------------------------------------------------
+                ctx = {
+                    "ts_local": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "bg": 1 if background_mode else 0,
+                    "port": port,
+                    "slave": slave,
+                    "target_vin": float(target_vin),
+                    "status": status_now,
+                    "mode_is_constv": bool(mode_is_constv),
+                    "band": band,
+                    "step_used": float(step_used),
+                    "vin": float(vin),
+                    "vset": float(vset),
+                    "outv": float(outv),
+                    "iout": float(iout),
+                    "pout": float(pout),
+                    "iset_read": float(iset),
+                    "iset_cmd": float(iset_cmd) if iset_cmd is not None else "",
+                    "new_iset": float(new_iset),
+                    "iceil": float(iceil),
+                    "err_vin": float(err_vin),
+                    "abs_err_vin": float(abs_err_vin),
+                    "vset_base": float(vset_base) if vset_base is not None else "",
+                    "vset_reduced": bool(vset_reduced),
+                    "extra_1": "",
+                    "extra_2": "",
+                    "extra_3": "",
+                }
+
+                last_log_t = _log_write_if_due(last_log_t, LOG_DELAY, ctx)
 
         except KeyboardInterrupt:
             # Ctrl-C: normal exit path; restore below in finally.
@@ -631,8 +767,7 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
 
             try:
                 if start_iset is not None:
-                    # set_iset(ser, slave, _quant_amps(start_iset))
-                    set_iset(ser, slave, _quant_amps(5.0))
+                    set_iset(ser, slave, _quant_amps(start_iset))
             except Exception as e:
                 print(f"ERR restore ISET: {e}")
 
