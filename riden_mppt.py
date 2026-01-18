@@ -64,7 +64,7 @@ import ctypes.wintypes
 # We write both because the device toggles both when the panel Output button is used.
 # -------------------------------------------------------------------------------------------------
 
-DEFAULT_TARGET_VIN = 33.0  # volts; good knee you found for your 36V panels
+DEFAULT_TARGET_VIN = 33.0  # volts; user provided target is treated as the fixed target when SAG is disabled
 
 # -------------------------------------------------------------------------------------------------
 # STATE NAMES (change in ONE place)
@@ -370,24 +370,35 @@ LOG_FIELDS = [
     "bg",
     "port",
     "slave",
+
+    "t_high",
+    "t_low",
     "target_vin",
+
+    "vout_ref",
+    "vout_sag",
+
     "status",
     "mode_is_constv",
     "band",
     "step_used",
+
     "vin",
     "vset",
     "outv",
     "iout",
     "pout",
     "iset_read",
+
     "iset_cmd",
     "new_iset",
     "iceil",
     "err_vin",
     "abs_err_vin",
+
     "vset_base",
     "vset_reduced",
+
     "extra_1",
     "extra_2",
     "extra_3",
@@ -455,11 +466,31 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
     I_OVER = 0.5  # how much ISET can exceed IOUT
     I_UNATTENDED = 15.0  # Best amps for RIDEN to use if MPPT controller is inactive (laptop off)
 
-    LOOP_DELAY = 0.5  # seconds
-    FAST_DELAY = 0.2  # seconds
-    LOG_DELAY = 5.0   # seconds
+    LOOP_DELAY = 0.20  # seconds; always fast (single loop rate)
+    LOG_DELAY = 5.0    # seconds
 
     STARTUP_DELAY_S = 8.0  # background wake: give USB/CH340 time to enumerate
+
+    # -------------------------------------------------------------------------------------------------
+    # SAG-BASED TARGET SHIFT (INSTANT DROP DETECTION)
+    # -------------------------------------------------------------------------------------------------
+    # SPEC (as discussed):
+    # - When SAG mode is DISABLED, target_vin MUST be fixed at the user target (T_HIGH).
+    # - When SAG mode is ENABLED, target_vin defaults to T_LOW (T_HIGH-2.5).
+    #     - If a sudden VOUT drop occurs (load step), push target_vin upward toward T_HIGH
+    #       to prevent the RD6024 from "falling out of lock".
+    #     - Then slowly relax target_vin back down toward T_LOW.
+    #
+    # IMPORTANT OPERATIONAL RULE:
+    # - VOUT-drop sag detection is not meaningful in CONST V; we do not use VOUT-drop sag
+    #   there. BUT we DO still regulate VIN in CONST V / BATT FULL using the fixed target
+    #   (T_HIGH) or whatever target_vin is currently set to (depending on SAG mode).
+    T_HIGH = float(vtarget)
+    T_LOW = float(T_HIGH - 2.5)
+
+    SAG_THRESH = 0.20            # volts; drop beyond this triggers target bump
+    SAG_K = 10.0                 # V per V; excess drop * K added to T_LOW, clamped to T_HIGH
+    TARGET_RELAX_V_PER_S = 0.10  # how fast target_vin returns toward T_LOW when no sag (SAG mode only)
 
     # -------------------------------------------------------------------------------------------------
     # 5-LEVEL STEP DIVISIONS (instead of 3)
@@ -486,8 +517,13 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
     # -------------------------------------------------------------------------------------------------
     FULL_I = 4.00  # Current out when battery is full (laptop etc. loads)
 
-    CONSTV_ENTER_EPS = 0.05  # enter CONST V when OUTV >= VSET - 0.CONSTV_ENTER_EPS
-    CONSTV_EXIT_EPS = 0.1   # exit CONST V only when OUTV <= VSET - CONSTV_EXIT_EPS
+    # SAG DISABLE THRESHOLD:
+    # - Below this current, SAG mode is disabled and target_vin is fixed at T_HIGH.
+    # - Above this current (and in MAX R, not CONST V), SAG mode can operate.
+    SAG_DISABLE_I = FULL_I + 4.0  # 8A by default
+
+    CONSTV_ENTER_EPS = 0.05  # enter CONST V when OUTV >= VSET - CONSTV_ENTER_EPS
+    CONSTV_EXIT_EPS = 0.10   # exit CONST V only when OUTV <= VSET - CONSTV_EXIT_EPS
 
     mode_is_constv = False  # sticky state
 
@@ -517,14 +553,22 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
             except Exception as e:
                 print(f"ERR set_output: {e}")
 
-            target_vin = vtarget
+            # Start with fixed target (SAG disabled) until we're clearly in high-current charging.
+            target_vin = float(T_HIGH)
             shutdown_start = None
             vset_base = None
             vset_reduced = False
 
             iset_cmd = None  # last command we intended (kept stable even if readback jitters)
 
-            print(f"START TARGET_VIN={target_vin:0.2f}V (default={DEFAULT_TARGET_VIN:0.2f}V)")
+            # Instant sag tracking (previous OUTV) - used only when SAG mode is enabled.
+            outv_prev = None
+            last_target_t = time.time()
+
+            print(
+                f"START T_HIGH={T_HIGH:0.2f}V  T_LOW={T_LOW:0.2f}V  "
+                f"(start TARGET_VIN={target_vin:0.2f}V)  LOOP={LOOP_DELAY:0.2f}s"
+            )
 
             while True:
                 try:
@@ -555,7 +599,9 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                 else:
                     status_now = STATE_MAX_R
 
-                # SHUTDOWN LAPTOP AT END OF THE DAY (only in background mode)
+                # -------------------------------------------------------------------------------------------------
+                # BACKGROUND AUTO-SHUTDOWN (unchanged behavior)
+                # -------------------------------------------------------------------------------------------------
                 if background_mode:
                     now = datetime.now()
                     after_sunset = now.hour >= SHUTDOWN_AFTER_HOUR
@@ -574,6 +620,53 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                         _shutdown_windows_now()
                         return
 
+                # -------------------------------------------------------------------------------------------------
+                # SAG MODE ENABLE (per spec)
+                # -------------------------------------------------------------------------------------------------
+                # - SAG mode is allowed only when current is high (>= SAG_DISABLE_I) AND we are not in CONST V.
+                # - When SAG mode is disabled, target_vin MUST be fixed at T_HIGH (user target).
+                sag_mode_allowed = (iout >= SAG_DISABLE_I) and (not mode_is_constv) and (status_now == STATE_MAX_R)
+
+                # -------------------------------------------------------------------------------------------------
+                # TARGET_vin UPDATE (per spec)
+                # -------------------------------------------------------------------------------------------------
+                vout_drop = 0.0
+                vout_ref = outv_prev if outv_prev is not None else outv  # logged as "vout_ref"
+
+                now_t = time.time()
+                dt_target = now_t - last_target_t
+                if dt_target < 0.0:
+                    dt_target = 0.0
+                last_target_t = now_t
+
+                if sag_mode_allowed:
+                    # Default to the lower target for efficiency.
+                    if target_vin > T_HIGH:
+                        target_vin = float(T_HIGH)
+                    if target_vin < T_LOW:
+                        target_vin = float(T_LOW)
+
+                    # Detect instantaneous VOUT drop (load step) and push target upward toward T_HIGH.
+                    if outv_prev is not None:
+                        vout_drop = outv_prev - outv
+                        if vout_drop < 0.0:
+                            vout_drop = 0.0
+
+                    if vout_drop > SAG_THRESH:
+                        excess = vout_drop - SAG_THRESH
+                        target_vin = clamp(T_LOW + (SAG_K * excess), T_LOW, T_HIGH)
+                    else:
+                        # No sag: relax back down toward T_LOW slowly.
+                        target_vin = max(T_LOW, target_vin - (TARGET_RELAX_V_PER_S * dt_target))
+                else:
+                    # SAG disabled: fixed target at the user setting (per your spec).
+                    target_vin = float(T_HIGH)
+
+                target_vin = _quant_volts(target_vin)
+
+                # Update prev OUTV at the end so it truly represents the prior sample.
+                outv_prev = outv
+
                 # Defaults for "current in use" logging.
                 band = ""
                 step_used = 0.0
@@ -582,7 +675,9 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                 err_vin = vin - target_vin
                 abs_err_vin = -err_vin if err_vin < 0.0 else err_vin
 
+                # -------------------------------------------------------------------------------------------------
                 # HARD CLOUD COLLAPSE:
+                # -------------------------------------------------------------------------------------------------
                 if vin < (target_vin - HARD_DROP):
                     band = "FAST"
                     step_used = 0.0
@@ -621,42 +716,48 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                         f"FAST RCVR TGT={target_vin:5.2f}  "
                         f"IOUT={iout:5.2f}A  "
                         f"PWR={pout:5.1f}W  "
-                        f"VIN={vin:5.2f}V  "
                         f"VIN={vin:5.2f}  ISET {iset:5.2f}->{new_iset:5.2f}  "
                         f"{status_now}"
                     )
 
-                    time.sleep(FAST_DELAY)
-
                 else:
                     # -------------------------------------------------------------------------------------------------
-                    # NORMAL CONTROL (5-level steps)
+                    # NORMAL CONTROL
                     # -------------------------------------------------------------------------------------------------
-                    if mode_is_constv or status_now == "BATT F":
+                    # We ALWAYS regulate VIN (even in CONST V / BATT FULL) so that when we slip back into MAX R,
+                    # we are already near the correct ISET and naturally in FINE/NEAR steps.
+                    #
+                    # The only thing we DO NOT do in CONST V / BATT FULL is VOUT-drop sag detection (handled above).
+                    if abs_err_vin > V4:
+                        step_up = HUGE_STEP_UP
+                        step_dn = HUGE_STEP_DN
+                        band = "HUGE"
+                    elif abs_err_vin > V3:
+                        step_up = FAR_STEP_UP
+                        step_dn = FAR_STEP_DN
+                        band = "FAR "
+                    elif abs_err_vin > V2:
+                        step_up = MID_STEP_UP
+                        step_dn = MID_STEP_DN
+                        band = "MID "
+                    elif abs_err_vin > V1:
+                        step_up = NEAR_STEP_UP
+                        step_dn = NEAR_STEP_DN
+                        band = "NEAR"
+                    else:
                         step_up = FINE_STEP_UP
                         step_dn = FINE_STEP_DN
                         band = "FINE"
-                    else:
-                        if abs_err_vin > V4:
-                            step_up = HUGE_STEP_UP
-                            step_dn = HUGE_STEP_DN
-                            band = "HUGE"
-                        elif abs_err_vin > V3:
-                            step_up = FAR_STEP_UP
-                            step_dn = FAR_STEP_DN
-                            band = "FAR "
-                        elif abs_err_vin > V2:
-                            step_up = MID_STEP_UP
-                            step_dn = MID_STEP_DN
-                            band = "MID "
-                        elif abs_err_vin > V1:
+
+                    # Gentle behavior only near the top end (battery full / in CONST V and low current).  # top-end only
+                    # Low current alone is NOT enough, because low current can also mean weak sun with an empty battery.  # avoid bottom-end slowdown
+                    if mode_is_constv and (iout < SAG_DISABLE_I):
+                        if step_up > NEAR_STEP_UP:
                             step_up = NEAR_STEP_UP
+                        if step_dn > NEAR_STEP_DN:
                             step_dn = NEAR_STEP_DN
+                        if band != "FINE":
                             band = "NEAR"
-                        else:
-                            step_up = FINE_STEP_UP
-                            step_dn = FINE_STEP_DN
-                            band = "FINE"
 
                     step_up = _quant_amps(step_up)
                     step_dn = _quant_amps(step_dn)
@@ -673,6 +774,7 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
 
                     new_iset = _quant_amps(clamp(new_iset, I_MIN, I_MAX))
 
+                    # Never command much more than what is actually flowing (+ margin).
                     if new_iset > iceil:
                         new_iset = iceil
 
@@ -686,25 +788,32 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                             continue
 
                     # VSET DROP/RESTORE FEATURE
-                    if status_now == STATE_BATT_FULL:
-                        if not vset_reduced:
-                            vset_base = vset
-                            vset_full = _quant_volts(max(0.0, vset_base - VSET_DROP_BATT_FULL))
-                            try:
-                                set_vset(ser, slave, vset_full)
-                                vset_reduced = True
-                            except Exception as e:
-                                print(f"ERR set_vset: {e}")
-                    else:
-                        if vset_reduced:
-                            try:
-                                set_vset(ser, slave, _quant_volts(vset_base))
-                            except Exception as e:
-                                print(f"ERR set_vset: {e}")
-                            vset_reduced = False
-                            vset_base = vset
+                    # Keep this gated away from the low-current / near-full region to avoid needless flapping.
+                    if iout >= SAG_DISABLE_I:
+                        if status_now == STATE_BATT_FULL:
+                            if not vset_reduced:
+                                vset_base = vset
+                                vset_full = _quant_volts(max(0.0, vset_base - VSET_DROP_BATT_FULL))
+                                try:
+                                    set_vset(ser, slave, vset_full)
+                                    vset_reduced = True
+                                except Exception as e:
+                                    print(f"ERR set_vset: {e}")
                         else:
-                            vset_base = vset
+                            if vset_reduced:
+                                try:
+                                    set_vset(ser, slave, _quant_volts(vset_base))
+                                except Exception as e:
+                                    print(f"ERR set_vset: {e}")
+                                vset_reduced = False
+                                vset_base = vset
+                            else:
+                                vset_base = vset
+
+                    # Show when sag target bump is active without spamming extra lines.
+                    sag_tag = ""
+                    if sag_mode_allowed and (vout_drop > SAG_THRESH):
+                        sag_tag = f" SAG={vout_drop:0.2f}V TGT={target_vin:0.2f}"
 
                     print(
                         f"VSET={vset:5.2f}V "
@@ -712,13 +821,12 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                         f"IOUT={iout:5.2f}A  | "
                         f"PWR={pout:5.1f}W  "
                         f"VIN={vin:5.2f}  "
+                        f"TGT={target_vin:5.2f}  "
                         f"ISET={iset_cmd:5.2f}  "
-                        f"STEP={step_used:2.2f}  "
                         f"{band}  "
                         f"{status_now}"
+                        f"{sag_tag}"
                     )
-
-                    time.sleep(LOOP_DELAY)
 
                 # -------------------------------------------------------------------------------------------------
                 # LOGGING (ONE PLACE: end of loop)
@@ -728,30 +836,43 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                     "bg": 1 if background_mode else 0,
                     "port": port,
                     "slave": slave,
+
+                    "t_high": float(T_HIGH),
+                    "t_low": float(T_LOW),
                     "target_vin": float(target_vin),
+
+                    "vout_ref": float(vout_ref),
+                    "vout_sag": float(vout_drop),
+
                     "status": status_now,
                     "mode_is_constv": bool(mode_is_constv),
                     "band": band,
                     "step_used": float(step_used),
+
                     "vin": float(vin),
                     "vset": float(vset),
                     "outv": float(outv),
                     "iout": float(iout),
                     "pout": float(pout),
                     "iset_read": float(iset),
+
                     "iset_cmd": float(iset_cmd) if iset_cmd is not None else "",
                     "new_iset": float(new_iset),
                     "iceil": float(iceil),
                     "err_vin": float(err_vin),
                     "abs_err_vin": float(abs_err_vin),
+
                     "vset_base": float(vset_base) if vset_base is not None else "",
                     "vset_reduced": bool(vset_reduced),
+
                     "extra_1": "",
                     "extra_2": "",
                     "extra_3": "",
                 }
 
                 last_log_t = _log_write_if_due(last_log_t, LOG_DELAY, ctx)
+
+                time.sleep(LOOP_DELAY)
 
         except KeyboardInterrupt:
             # Ctrl-C: normal exit path; restore below in finally.
