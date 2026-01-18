@@ -520,7 +520,7 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
     # SAG DISABLE THRESHOLD:
     # - Below this current, SAG mode is disabled and target_vin is fixed at T_HIGH.
     # - Above this current (and in MAX R, not CONST V), SAG mode can operate.
-    SAG_DISABLE_I = FULL_I + 4.0  # 8A by default
+    SAG_DISABLE_I = FULL_I + 8.0  # 8A by default
 
     CONSTV_ENTER_EPS = 0.05  # enter CONST V when OUTV >= VSET - CONSTV_ENTER_EPS
     CONSTV_EXIT_EPS = 0.10   # exit CONST V only when OUTV <= VSET - CONSTV_EXIT_EPS
