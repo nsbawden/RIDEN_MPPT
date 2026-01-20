@@ -65,6 +65,9 @@ import ctypes.wintypes
 # -------------------------------------------------------------------------------------------------
 
 DEFAULT_TARGET_VIN = 33.0  # volts; user provided target is treated as the fixed target when SAG is disabled
+V_UNATTENDED = 15.0  # Best set volts for RIDEN to use if MPPT controller is inactive (laptop off)
+I_UNATTENDED = 15.0  # Best amps for RIDEN to use if MPPT controller is inactive (laptop off)
+START_VSET = 15.0 # Initial vset
 
 # -------------------------------------------------------------------------------------------------
 # STATE NAMES (change in ONE place)
@@ -257,16 +260,36 @@ def _modbus_write_reg(
         ser.write(frame)
         ser.flush()
 
-        rx = _read_exact(ser, 8, timeout_s)  # normal echo is 8 bytes
+        # Read first 2 bytes to determine response type.
+        hdr = _read_exact(ser, 2, timeout_s)  # [slave][func]
+        if len(hdr) != 2:
+            continue
+        if hdr[0] != slave:
+            continue
+
+        func = hdr[1]
+
+        if func == (0x06 | 0x80):
+            # Exception response is 5 bytes total: slave, func|0x80, exc_code, crc_lo, crc_hi
+            tail = _read_exact(ser, 3, timeout_s)
+            rx = hdr + tail
+            if len(rx) != 5:
+                continue
+            if not _crc_ok(rx):
+                continue
+            exc = rx[2]
+            raise RuntimeError(f"Modbus exception write code=0x{exc:02X}")
+
+        if func != 0x06:
+            continue
+
+        # Normal response is 8 bytes total: slave, func, addr_hi, addr_lo, val_hi, val_lo, crc_lo, crc_hi
+        tail = _read_exact(ser, 6, timeout_s)
+        rx = hdr + tail
         if len(rx) != 8:
             continue
         if not _crc_ok(rx):
             continue
-        if rx[0] != slave:
-            continue
-
-        if rx[1] == (0x06 | 0x80):
-            raise RuntimeError(f"Modbus exception write code=0x{rx[2]:02X}")
 
         if rx[:6] == pdu:  # device echoes our request PDU on success
             return
@@ -346,6 +369,27 @@ def _shutdown_windows_now() -> None:
     # subprocess.run(["shutdown", "/s", "/f", "/t", "0"], check=False)
     subprocess.run(["shutdown", "/h"], check=False)
 
+def _mppt_exit(ser, slave: int) -> None:
+    # Restore RIDEN values.
+    vset = V_UNATTENDED
+    iset = I_UNATTENDED
+    
+    now = datetime.now()
+    after_noon = now.hour >= 12
+    
+    if (after_noon): vset = 14.4
+    
+    try:
+        set_vset(ser, slave, _quant_volts(vset))
+    except Exception as e:
+        print(f"ERR restore VSET: {e}")
+
+    try:
+        set_iset(ser, slave, _quant_amps(iset))
+    except Exception as e:
+        print(f"ERR restore ISET: {e}")
+
+
 
 # -------------------------------------------------------------------------------------------------
 # CSV LOGGING (single definition point)
@@ -368,40 +412,14 @@ def _log_file_name(now: datetime) -> str:
 LOG_FIELDS = [
     "ts_local",
     "bg",
-    "port",
-    "slave",
-
-    "t_high",
-    "t_low",
-    "target_vin",
-
-    "vout_ref",
-    "vout_sag",
-
     "status",
-    "mode_is_constv",
     "band",
-    "step_used",
-
+    "target_vin",
     "vin",
     "vset",
     "outv",
     "iout",
     "pout",
-    "iset_read",
-
-    "iset_cmd",
-    "new_iset",
-    "iceil",
-    "err_vin",
-    "abs_err_vin",
-
-    "vset_base",
-    "vset_reduced",
-
-    "extra_1",
-    "extra_2",
-    "extra_3",
 ]
 
 
@@ -453,10 +471,10 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
     # ---------------------------------------------------------------------------------------------
 
     SHUTDOWN_AFTER_HOUR = 17  # 5pm
-    SHUTDOWN_WATTS = 15.0     # approx laptop draw threshold
+    SHUTDOWN_WATTS = 45.0     # approx laptop draw threshold
     SHUTDOWN_HOLD_S = 300     # seconds below threshold before shutdown (5 min)
 
-    VSET_DROP_BATT_FULL = 0.30  # volts to reduce VSET when in BATT F state
+    VSET_DROP_BATT_FULL = 0.60  # volts to reduce VSET when in BATT F state
 
     VIN_BAND = 0.00  # volts; deadband around target to avoid constant chatter
     HARD_DROP = 5.0  # volts; collapse trigger (VIN far below target => emergency backoff)
@@ -464,7 +482,6 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
     I_MIN = 0.01
     I_MAX = 24.0  # amps; your chosen maximum current pull
     I_OVER = 0.5  # how much ISET can exceed IOUT
-    I_UNATTENDED = 15.0  # Best amps for RIDEN to use if MPPT controller is inactive (laptop off)
 
     LOOP_DELAY = 0.20  # seconds; always fast (single loop rate)
     LOG_DELAY = 5.0    # seconds
@@ -486,7 +503,8 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
     #   there. BUT we DO still regulate VIN in CONST V / BATT FULL using the fixed target
     #   (T_HIGH) or whatever target_vin is currently set to (depending on SAG mode).
     T_HIGH = float(vtarget)
-    T_LOW = float(T_HIGH - 2.5)
+    T_LOW_BASE = float(T_HIGH - 2.5)
+    T_LOW = T_LOW_BASE
 
     SAG_THRESH = 0.20            # volts; drop beyond this triggers target bump
     SAG_K = 10.0                 # V per V; excess drop * K added to T_LOW, clamped to T_HIGH
@@ -496,19 +514,24 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
     # 5-LEVEL STEP DIVISIONS (instead of 3)
     # -------------------------------------------------------------------------------------------------
 
-    V1 = 1.00  # fine/near boundary
-    V2 = 1.50  # near/mid boundary
-    V3 = 1.75  # mid/far boundary
+    # V1 = 1.00  # fine/near boundary
+    # V2 = 1.25  # near/mid boundary
+    # V3 = 1.50  # mid/far boundary
+    # V4 = 2.00  # far/huge boundary
+
+    V1 = 0.50  # fine/near boundary
+    V2 = 1.00  # near/mid boundary
+    V3 = 1.50  # mid/far boundary
     V4 = 2.00  # far/huge boundary
 
     HUGE_STEP_UP = 1.75
     HUGE_STEP_DN = 1.75
-    FAR_STEP_UP = 0.10
-    FAR_STEP_DN = 0.10
-    MID_STEP_UP = 0.06
-    MID_STEP_DN = 0.06
-    NEAR_STEP_UP = 0.03
-    NEAR_STEP_DN = 0.03
+    FAR_STEP_UP = 0.20
+    FAR_STEP_DN = 0.20
+    MID_STEP_UP = 0.10
+    MID_STEP_DN = 0.10
+    NEAR_STEP_UP = 0.05
+    NEAR_STEP_DN = 0.05
     FINE_STEP_UP = 0.01
     FINE_STEP_DN = 0.01
 
@@ -516,16 +539,17 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
     # CHARGE/MODE DETECTION (with hysteresis so mode does not flap on 0.01-0.03V noise)
     # -------------------------------------------------------------------------------------------------
     FULL_I = 4.00  # Current out when battery is full (laptop etc. loads)
+    REDUCED_DISABLE_I = FULL_I + 8.0 # Current to come out of vset_reduced
 
     # SAG DISABLE THRESHOLD:
     # - Below this current, SAG mode is disabled and target_vin is fixed at T_HIGH.
     # - Above this current (and in MAX R, not CONST V), SAG mode can operate.
-    SAG_DISABLE_I = FULL_I + 8.0  # 8A by default
+    SAG_DISABLE_I = FULL_I + 8.0  # 12A by default
 
     CONSTV_ENTER_EPS = 0.05  # enter CONST V when OUTV >= VSET - CONSTV_ENTER_EPS
     CONSTV_EXIT_EPS = 0.10   # exit CONST V only when OUTV <= VSET - CONSTV_EXIT_EPS
 
-    mode_is_constv = False  # sticky state
+    is_v_limited = False  # sticky state
 
     if background_mode:
         time.sleep(STARTUP_DELAY_S)
@@ -552,6 +576,15 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                 set_output(ser, slave, True)
             except Exception as e:
                 print(f"ERR set_output: {e}")
+                
+            # Start with fixed vset
+            try:
+                vset = START_VSET
+                set_vset(ser, slave, _quant_volts(vset))
+                time.sleep(0.1)
+            except Exception as e:
+                print(f"ERR initializing VSET: {e}")
+
 
             # Start with fixed target (SAG disabled) until we're clearly in high-current charging.
             target_vin = float(T_HIGH)
@@ -570,6 +603,9 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                 f"(start TARGET_VIN={target_vin:0.2f}V)  LOOP={LOOP_DELAY:0.2f}s"
             )
 
+            # -------------------------------------------------------------------------------------------------
+            # MAIN LOOP
+            # -------------------------------------------------------------------------------------------------
             while True:
                 try:
                     vset, iset, outv, iout, pout, vin, on = read_status(ser, slave)
@@ -585,50 +621,72 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                     iset_cmd = iset
 
                 # Sticky CONST V detection with hysteresis.
-                if mode_is_constv:
+                if is_v_limited:
                     if outv <= (vset - CONSTV_EXIT_EPS):
-                        mode_is_constv = False
+                        is_v_limited = False
                 else:
                     if outv >= (vset - CONSTV_ENTER_EPS):
-                        mode_is_constv = True
+                        is_v_limited = True
 
-                if mode_is_constv and (iout < FULL_I):
+                # Current-dependent allowed sag (ΔV = T_HIGH - T_LOW).
+                # Idea: start from dv_base (the full sag you allow at high current), then scale it down
+                # as current falls toward 12A. Below 12A, sag is disabled (ΔV=0 => T_LOW=T_HIGH).
+                dv_base = T_HIGH - T_LOW_BASE                 # full allowed sag at high current (typically 2.5V)
+
+                SAG_GAIN = 0.60                                # ONE knob: 1.0 = normal, <1 less sag, >1 more sag
+
+                # cur_frac = (iout - 8.0) / 10.0               # 8A->0, 18A->1
+                # dv_allow = dv_base * SAG_GAIN * (cur_frac * cur_frac)
+                cur_frac = clamp((iout - 8.0) / 10.0, 0.0, 1.0)
+                dv_allow = dv_base * SAG_GAIN * (cur_frac * cur_frac)
+                
+
+                dv_allow = clamp(dv_allow, 0.0, dv_base)     # sanity: 0..dv_base
+                T_LOW = T_HIGH - dv_allow                    # sanity: T_LOW in [T_LOW_BASE..T_HIGH]
+
+                # -------------------------------------------------------------------------------------------------
+                # CLASSIFICATION FLAGS (single place for understandability + future tweaking)
+                # -------------------------------------------------------------------------------------------------
+                # These names are used everywhere below so behavior can be adjusted by tweaking this block, not by
+                # editing many scattered compound conditions.
+                is_soaking = bool(is_v_limited and (iout < FULL_I)) # CONST V or BATT F and low current
+                is_high_current = bool(iout >= SAG_DISABLE_I)
+                is_max_r = bool(not is_v_limited)
+
+                # Status is derived from the same flags we actually use for decisions below (keeps logs consistent).
+                if is_soaking:
                     status_now = STATE_BATT_FULL
-                elif mode_is_constv:
+                elif is_v_limited:
                     status_now = STATE_CONST_V
                 else:
                     status_now = STATE_MAX_R
 
                 # -------------------------------------------------------------------------------------------------
-                # BACKGROUND AUTO-SHUTDOWN (unchanged behavior)
+                # AUTO-SHUTDOWN
                 # -------------------------------------------------------------------------------------------------
-                if background_mode:
-                    now = datetime.now()
-                    after_sunset = now.hour >= SHUTDOWN_AFTER_HOUR
+                now = datetime.now()
+                after_sunset = now.hour >= SHUTDOWN_AFTER_HOUR
 
-                    if after_sunset and (pout < SHUTDOWN_WATTS):
-                        if shutdown_start is None:
-                            shutdown_start = time.time()
-                    else:
-                        shutdown_start = None
+                if after_sunset and (pout < SHUTDOWN_WATTS):
+                    if shutdown_start is None:
+                        shutdown_start = time.time()
+                else:
+                    shutdown_start = None
 
-                    if shutdown_start is not None and (time.time() - shutdown_start) >= SHUTDOWN_HOLD_S:
-                        try:
-                            set_iset(ser, slave, _quant_amps(clamp(I_UNATTENDED, I_MIN, I_MAX)))  # set RIDEN for best without controller
-                        except Exception:
-                            pass
-                        _shutdown_windows_now()
-                        return
+                if shutdown_start is not None and (time.time() - shutdown_start) >= SHUTDOWN_HOLD_S:
+                    _mppt_exit(ser, slave)
+                    _shutdown_windows_now()
+                    return
 
                 # -------------------------------------------------------------------------------------------------
-                # SAG MODE ENABLE (per spec)
+                # SAG MODE ENABLE
                 # -------------------------------------------------------------------------------------------------
-                # - SAG mode is allowed only when current is high (>= SAG_DISABLE_I) AND we are not in CONST V.
+                # - SAG mode is allowed only when current is high (>= SAG_DISABLE_I) AND we are in MAX R.
                 # - When SAG mode is disabled, target_vin MUST be fixed at T_HIGH (user target).
-                sag_mode_allowed = (iout >= SAG_DISABLE_I) and (not mode_is_constv) and (status_now == STATE_MAX_R)
+                sag_mode_allowed = is_high_current and is_max_r
 
                 # -------------------------------------------------------------------------------------------------
-                # TARGET_vin UPDATE (per spec)
+                # TARGET_vin UPDATE (SAG MODE)
                 # -------------------------------------------------------------------------------------------------
                 vout_drop = 0.0
                 vout_ref = outv_prev if outv_prev is not None else outv  # logged as "vout_ref"
@@ -675,13 +733,14 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                 err_vin = vin - target_vin
                 abs_err_vin = -err_vin if err_vin < 0.0 else err_vin
 
-                # -------------------------------------------------------------------------------------------------
-                # HARD CLOUD COLLAPSE:
-                # -------------------------------------------------------------------------------------------------
                 if vin < (target_vin - HARD_DROP):
+                    # -------------------------------------------------------------------------------------------------
+                    # HARD CLOUD COLLAPSE:
+                    # -------------------------------------------------------------------------------------------------
                     band = "FAST"
                     step_used = 0.0
-                    new_iset = _quant_amps(clamp(iset * 0.7, I_MIN, I_MAX))
+                    # new_iset = _quant_amps(clamp(iset * 0.7, I_MIN, I_MAX))
+                    new_iset = _quant_amps(clamp(iset_cmd * 0.7, I_MIN, I_MAX))
 
                     try:
                         set_iset(ser, slave, new_iset)
@@ -691,32 +750,11 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                         time.sleep(0.5)
                         continue
 
-                    # VSET DROP/RESTORE FEATURE
-                    if status_now == STATE_BATT_FULL:
-                        if not vset_reduced:
-                            vset_base = vset
-                            vset_full = _quant_volts(max(0.0, vset_base - VSET_DROP_BATT_FULL))
-                            try:
-                                set_vset(ser, slave, vset_full)
-                                vset_reduced = True
-                            except Exception:
-                                pass
-                    else:
-                        if vset_reduced:
-                            try:
-                                set_vset(ser, slave, _quant_volts(vset_base))
-                            except Exception:
-                                pass
-                            vset_reduced = False
-                            vset_base = vset
-                        else:
-                            vset_base = vset
-
                     print(
-                        f"FAST RCVR TGT={target_vin:5.2f}  "
+                        f"FAST RECOVER TGT={target_vin:5.2f}  "
                         f"IOUT={iout:5.2f}A  "
                         f"PWR={pout:5.1f}W  "
-                        f"VIN={vin:5.2f}  ISET {iset:5.2f}->{new_iset:5.2f}  "
+                        f"VIN={vin:5.2f}  ISET {iset_cmd:5.2f}->{new_iset:5.2f}  "
                         f"{status_now}"
                     )
 
@@ -751,13 +789,10 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
 
                     # Gentle behavior only near the top end (battery full / in CONST V and low current).  # top-end only
                     # Low current alone is NOT enough, because low current can also mean weak sun with an empty battery.  # avoid bottom-end slowdown
-                    if mode_is_constv and (iout < SAG_DISABLE_I):
-                        if step_up > NEAR_STEP_UP:
-                            step_up = NEAR_STEP_UP
-                        if step_dn > NEAR_STEP_DN:
-                            step_dn = NEAR_STEP_DN
-                        if band != "FINE":
-                            band = "NEAR"
+                    # if is_soaking:
+                    #     step_up = FINE_STEP_UP
+                    #     step_dn = FINE_STEP_DN
+                    #     band = "FINE"
 
                     step_up = _quant_amps(step_up)
                     step_dn = _quant_amps(step_dn)
@@ -767,7 +802,7 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                         step_used = step_up
                     elif err_vin < -VIN_BAND:
                         new_iset = float(iset_cmd) - step_dn
-                        step_used = step_dn
+                        step_used = -step_dn
                     else:
                         new_iset = float(iset_cmd)
                         step_used = 0.0
@@ -775,8 +810,9 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                     new_iset = _quant_amps(clamp(new_iset, I_MIN, I_MAX))
 
                     # Never command much more than what is actually flowing (+ margin).
-                    if new_iset > iceil:
+                    if new_iset > iceil and is_v_limited:
                         new_iset = iceil
+                        step_used = 9.99
 
                     if new_iset != iset_cmd:
                         try:
@@ -789,8 +825,8 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
 
                     # VSET DROP/RESTORE FEATURE
                     # Keep this gated away from the low-current / near-full region to avoid needless flapping.
-                    if iout >= SAG_DISABLE_I:
-                        if status_now == STATE_BATT_FULL:
+                    if not is_high_current:
+                        if is_soaking:
                             if not vset_reduced:
                                 vset_base = vset
                                 vset_full = _quant_volts(max(0.0, vset_base - VSET_DROP_BATT_FULL))
@@ -800,7 +836,8 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                                 except Exception as e:
                                     print(f"ERR set_vset: {e}")
                         else:
-                            if vset_reduced:
+                            # Huge hysterisis required to come out of vset_reduced
+                            if vset_reduced and iout > REDUCED_DISABLE_I:
                                 try:
                                     set_vset(ser, slave, _quant_volts(vset_base))
                                 except Exception as e:
@@ -823,7 +860,8 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                         f"VIN={vin:5.2f}  "
                         f"TGT={target_vin:5.2f}  "
                         f"ISET={iset_cmd:5.2f}  "
-                        f"{band}  "
+                        f"{step_used:+5.2f}  "
+                        f"{'[' + band + ']' if is_v_limited else ' ' + band + ' '}  "
                         f"{status_now}"
                         f"{sag_tag}"
                     )
@@ -834,40 +872,14 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                 ctx = {
                     "ts_local": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "bg": 1 if background_mode else 0,
-                    "port": port,
-                    "slave": slave,
-
-                    "t_high": float(T_HIGH),
-                    "t_low": float(T_LOW),
-                    "target_vin": float(target_vin),
-
-                    "vout_ref": float(vout_ref),
-                    "vout_sag": float(vout_drop),
-
                     "status": status_now,
-                    "mode_is_constv": bool(mode_is_constv),
                     "band": band,
-                    "step_used": float(step_used),
-
+                    "target_vin": float(target_vin),
                     "vin": float(vin),
                     "vset": float(vset),
                     "outv": float(outv),
                     "iout": float(iout),
                     "pout": float(pout),
-                    "iset_read": float(iset),
-
-                    "iset_cmd": float(iset_cmd) if iset_cmd is not None else "",
-                    "new_iset": float(new_iset),
-                    "iceil": float(iceil),
-                    "err_vin": float(err_vin),
-                    "abs_err_vin": float(abs_err_vin),
-
-                    "vset_base": float(vset_base) if vset_base is not None else "",
-                    "vset_reduced": bool(vset_reduced),
-
-                    "extra_1": "",
-                    "extra_2": "",
-                    "extra_3": "",
                 }
 
                 last_log_t = _log_write_if_due(last_log_t, LOG_DELAY, ctx)
@@ -878,25 +890,8 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
             # Ctrl-C: normal exit path; restore below in finally.
             return
         finally:
-            # Restore RIDEN values captured at program start (best-effort).
-            # Note: do not print success logs; only errors.
-            try:
-                if start_vset is not None:
-                    set_vset(ser, slave, _quant_volts(start_vset))
-            except Exception as e:
-                print(f"ERR restore VSET: {e}")
-
-            try:
-                if start_iset is not None:
-                    set_iset(ser, slave, _quant_amps(start_iset))
-            except Exception as e:
-                print(f"ERR restore ISET: {e}")
-
-            try:
-                if start_on is not None:
-                    set_output(ser, slave, bool(start_on))
-            except Exception as e:
-                print(f"ERR restore OUTPUT: {e}")
+            # Restore RIDEN values.
+            _mppt_exit(ser, slave)
 
 
 if __name__ == "__main__":
