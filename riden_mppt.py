@@ -490,30 +490,22 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
     STARTUP_DELAY_S = 8.0  # background wake: give USB/CH340 time to enumerate
 
     # -------------------------------------------------------------------------------------------------
-    # HCC-OFFSET TARGET CONTROL (REPLACES SAG COMPLETELY)
+    # HCC-OFFSET TARGET CONTROL
     # -------------------------------------------------------------------------------------------------
-    # GOAL:
-    # - Replace SAG with one mechanism that is easy to read in logs and robust under clouds.
-    # - Maintain an offset (in fixed 0.10V steps) around the user base target:
-    #
-    #       target_vin = T_USER + hcc_offset_v
-    #
-    # OPERATION:
-    # - "Probe down" for more power:
-    #     - If we have been stable (no HCC episodes) for HCC_QUIET_S seconds, and VIN is tracking near target,
-    #       step offset DOWN by 0.10V (more aggressive; closer to PV knee).
-    # - "Back off" on collapse:
-    #     - On each HCC EPISODE (edge-triggered), step offset UP by 0.10V (less aggressive; more stable).
-    # - First HCC episode after startup is ignored (common due to initial RIDEN state).
-    #
-    # NOTES:
-    # - This is intentionally simple and observable.
-    # - Stability guard prevents stepping down when we're already struggling to reach target.
-    HCC_STEP_V = 0.10
-    HCC_OFFSET_MIN_V = -2.00
-    HCC_OFFSET_MAX_V =  2.00
-    HCC_QUIET_S = 60.0             # you found 60 works well
-    HCC_DECAY_STABLE_EPS = 0.50     # require VIN >= (target - eps) before probing down
+    HCC_STEP_V = 0.10              # volts per adjustment; smaller = slower/smoother knee search
+    HCC_OFFSET_MIN_V = -2.00       # max aggressive drift (T_USER - 2V); limits how close to knee we probe
+    HCC_OFFSET_MAX_V =  2.00       # max conservative drift (T_USER + 2V); limits how far we back off
+    HCC_QUIET_S = 60.0             # seconds with no HCC events before drifting more aggressive
+    HCC_DECAY_STABLE_EPS = 0.50    # VIN must be within this of target before allowing aggressive drift
+
+    # -------------------------------------------------------------------------------------------------
+    # SAFE POST-HCC RECOVERY ACCELERATION (NO JUMPS)
+    # -------------------------------------------------------------------------------------------------
+    # After an HCC collapse, VIN often rebounds very high (unloaded PV). We can climb ISET faster
+    # for a short time, but still monotonically and still respecting band logic.
+    RECOVERY_WINDOW_S = 6.0   # accelerate only briefly after leaving HCC
+    RECOVERY_ERR_V = 1.50     # only when VIN is > target + this
+    RECOVERY_GAIN = 2.0       # multiply step_up by this during recovery window (bounded below)
 
     # -------------------------------------------------------------------------------------------------
     # 5-LEVEL STEP DIVISIONS
@@ -598,6 +590,9 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
             last_no_hcc_t = time.time()  # time anchor for "quiet" stability probe-down
             in_hcc = False               # True while VIN is in "HCC zone"
             first_hcc_ignored = False    # ignore the first HCC episode only
+
+            # Track exit time to enable brief post-HCC acceleration.
+            last_hcc_exit_t = -1e9
 
             # Start with fixed target derived from base + offset.
             target_vin = _quant_volts(T_USER + hcc_offset_v)
@@ -694,16 +689,11 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                     # Exited the HCC episode.
                     in_hcc = False
                     last_no_hcc_t = time.time()  # start quiet timer once we're back out
+                    last_hcc_exit_t = time.time()
 
                 # -------------------------------------------------------------------------------------------------
                 # STABLE "PROBE DOWN" (bidirectional behavior)
                 # -------------------------------------------------------------------------------------------------
-                # Only probe down when:
-                # - we're NOT currently in an HCC episode
-                # - quiet timer has elapsed
-                # - VIN is tracking close enough to target (stability guard)
-                #
-                # This slowly walks target down (more aggressive) until an HCC pushes it back up.
                 now_t0 = time.time()
                 if (not in_hcc) and ((now_t0 - last_no_hcc_t) >= HCC_QUIET_S):
                     if vin >= (target_vin - HCC_DECAY_STABLE_EPS):
@@ -725,7 +715,6 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                     # -------------------------------------------------------------------------------------------------
                     # HARD CLOUD COLLAPSE:
                     # -------------------------------------------------------------------------------------------------
-                    # Emergency current backoff only. Offset bump is handled on episode ENTRY above.
                     band = "FAST"
                     step_used = 0.0
 
@@ -771,6 +760,12 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                         step_up = FINE_STEP_UP
                         step_dn = FINE_STEP_DN
                         band = "FINE"
+
+                    # SAFE post-HCC acceleration (still monotonic; no jumps)
+                    # Only for a short window after leaving HCC, and only when VIN is well above target.
+                    if (time.time() - last_hcc_exit_t) <= RECOVERY_WINDOW_S:
+                        if err_vin > RECOVERY_ERR_V:
+                            step_up = min(step_up * RECOVERY_GAIN, HUGE_STEP_UP)  # cap at HUGE_STEP_UP
 
                     step_up = _quant_amps(step_up)
                     step_dn = _quant_amps(step_dn)
