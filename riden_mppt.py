@@ -68,6 +68,7 @@ DEFAULT_TARGET_VIN = 33.0  # volts; user provided target is treated as the fixed
 V_UNATTENDED = 15.0  # Best set volts for RIDEN to use if MPPT controller is inactive (laptop off)
 I_UNATTENDED = 15.0  # Best amps for RIDEN to use if MPPT controller is inactive (laptop off)
 START_VSET = 15.0 # Initial vset
+START_ISET = 0.01 # Initial iset
 
 # -------------------------------------------------------------------------------------------------
 # STATE NAMES (change in ONE place)
@@ -489,36 +490,34 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
     STARTUP_DELAY_S = 8.0  # background wake: give USB/CH340 time to enumerate
 
     # -------------------------------------------------------------------------------------------------
-    # SAG-BASED TARGET SHIFT (INSTANT DROP DETECTION)
+    # HCC-OFFSET TARGET CONTROL (REPLACES SAG COMPLETELY)
     # -------------------------------------------------------------------------------------------------
-    # SPEC (as discussed):
-    # - When SAG mode is DISABLED, target_vin MUST be fixed at the user target (T_HIGH).
-    # - When SAG mode is ENABLED, target_vin defaults to T_LOW (T_HIGH-2.5).
-    #     - If a sudden VOUT drop occurs (load step), push target_vin upward toward T_HIGH
-    #       to prevent the RD6024 from "falling out of lock".
-    #     - Then slowly relax target_vin back down toward T_LOW.
+    # GOAL:
+    # - Replace SAG with one mechanism that is easy to read in logs and robust under clouds.
+    # - Maintain an offset (in fixed 0.10V steps) around the user base target:
     #
-    # IMPORTANT OPERATIONAL RULE:
-    # - VOUT-drop sag detection is not meaningful in CONST V; we do not use VOUT-drop sag
-    #   there. BUT we DO still regulate VIN in CONST V / BATT FULL using the fixed target
-    #   (T_HIGH) or whatever target_vin is currently set to (depending on SAG mode).
-    T_HIGH = float(vtarget)
-    T_LOW_BASE = float(T_HIGH - 2.5)
-    T_LOW = T_LOW_BASE
-
-    SAG_THRESH = 0.20            # volts; drop beyond this triggers target bump
-    SAG_K = 10.0                 # V per V; excess drop * K added to T_LOW, clamped to T_HIGH
-    TARGET_RELAX_V_PER_S = 0.10  # how fast target_vin returns toward T_LOW when no sag (SAG mode only)
+    #       target_vin = T_USER + hcc_offset_v
+    #
+    # OPERATION:
+    # - "Probe down" for more power:
+    #     - If we have been stable (no HCC episodes) for HCC_QUIET_S seconds, and VIN is tracking near target,
+    #       step offset DOWN by 0.10V (more aggressive; closer to PV knee).
+    # - "Back off" on collapse:
+    #     - On each HCC EPISODE (edge-triggered), step offset UP by 0.10V (less aggressive; more stable).
+    # - First HCC episode after startup is ignored (common due to initial RIDEN state).
+    #
+    # NOTES:
+    # - This is intentionally simple and observable.
+    # - Stability guard prevents stepping down when we're already struggling to reach target.
+    HCC_STEP_V = 0.10
+    HCC_OFFSET_MIN_V = -2.00
+    HCC_OFFSET_MAX_V =  2.00
+    HCC_QUIET_S = 60.0             # you found 60 works well
+    HCC_DECAY_STABLE_EPS = 0.50     # require VIN >= (target - eps) before probing down
 
     # -------------------------------------------------------------------------------------------------
-    # 5-LEVEL STEP DIVISIONS (instead of 3)
+    # 5-LEVEL STEP DIVISIONS
     # -------------------------------------------------------------------------------------------------
-
-    # V1 = 1.00  # fine/near boundary
-    # V2 = 1.25  # near/mid boundary
-    # V3 = 1.50  # mid/far boundary
-    # V4 = 2.00  # far/huge boundary
-
     V1 = 0.50  # fine/near boundary
     V2 = 1.00  # near/mid boundary
     V3 = 1.50  # mid/far boundary
@@ -536,18 +535,16 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
     FINE_STEP_DN = 0.01
 
     # -------------------------------------------------------------------------------------------------
-    # CHARGE/MODE DETECTION (with hysteresis so mode does not flap on 0.01-0.03V noise)
+    # CHARGE/MODE DETECTION (with hysteresis)
     # -------------------------------------------------------------------------------------------------
-    FULL_I = 4.00  # Current out when battery is full (laptop etc. loads)
-    REDUCED_DISABLE_I = FULL_I + 8.0 # Current to come out of vset_reduced
+    FULL_I = 4.00                 # Current out when battery is full (laptop etc. loads)
+    REDUCED_DISABLE_I = FULL_I + 8.0
 
-    # SAG DISABLE THRESHOLD:
-    # - Below this current, SAG mode is disabled and target_vin is fixed at T_HIGH.
-    # - Above this current (and in MAX R, not CONST V), SAG mode can operate.
-    SAG_DISABLE_I = FULL_I + 8.0  # 12A by default
+    CONSTV_ENTER_EPS = 0.05
+    CONSTV_EXIT_EPS = 0.10
 
-    CONSTV_ENTER_EPS = 0.05  # enter CONST V when OUTV >= VSET - CONSTV_ENTER_EPS
-    CONSTV_EXIT_EPS = 0.10   # exit CONST V only when OUTV <= VSET - CONSTV_EXIT_EPS
+    # "High current" is used only for your VSET drop gating (unchanged behavior).
+    HIGH_CURRENT_I = FULL_I + 8.0  # 12A default
 
     is_v_limited = False  # sticky state
 
@@ -576,8 +573,8 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                 set_output(ser, slave, True)
             except Exception as e:
                 print(f"ERR set_output: {e}")
-                
-            # Start with fixed vset
+
+            # Start with fixed vset.
             try:
                 vset = START_VSET
                 set_vset(ser, slave, _quant_volts(vset))
@@ -585,21 +582,34 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
             except Exception as e:
                 print(f"ERR initializing VSET: {e}")
 
+            # Start with fixed iset (very low).
+            try:
+                iset = START_ISET
+                set_iset(ser, slave, _quant_amps(iset))  # amps, not volts
+                time.sleep(0.1)
+            except Exception as e:
+                print(f"ERR initializing ISET: {e}")
 
-            # Start with fixed target (SAG disabled) until we're clearly in high-current charging.
-            target_vin = float(T_HIGH)
+            # Base target is user-provided.
+            T_USER = float(vtarget)
+
+            # HCC offset state.
+            hcc_offset_v = 0.0
+            last_no_hcc_t = time.time()  # time anchor for "quiet" stability probe-down
+            in_hcc = False               # True while VIN is in "HCC zone"
+            first_hcc_ignored = False    # ignore the first HCC episode only
+
+            # Start with fixed target derived from base + offset.
+            target_vin = _quant_volts(T_USER + hcc_offset_v)
+
             shutdown_start = None
             vset_base = None
             vset_reduced = False
 
             iset_cmd = None  # last command we intended (kept stable even if readback jitters)
 
-            # Instant sag tracking (previous OUTV) - used only when SAG mode is enabled.
-            outv_prev = None
-            last_target_t = time.time()
-
             print(
-                f"START T_HIGH={T_HIGH:0.2f}V  T_LOW={T_LOW:0.2f}V  "
+                f"START T_USER={T_USER:0.2f}V  "
                 f"(start TARGET_VIN={target_vin:0.2f}V)  LOOP={LOOP_DELAY:0.2f}s"
             )
 
@@ -628,32 +638,11 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                     if outv >= (vset - CONSTV_ENTER_EPS):
                         is_v_limited = True
 
-                # Current-dependent allowed sag (ΔV = T_HIGH - T_LOW).
-                # Idea: start from dv_base (the full sag you allow at high current), then scale it down
-                # as current falls toward 12A. Below 12A, sag is disabled (ΔV=0 => T_LOW=T_HIGH).
-                dv_base = T_HIGH - T_LOW_BASE                 # full allowed sag at high current (typically 2.5V)
-
-                SAG_GAIN = 0.60                                # ONE knob: 1.0 = normal, <1 less sag, >1 more sag
-
-                # cur_frac = (iout - 8.0) / 10.0               # 8A->0, 18A->1
-                # dv_allow = dv_base * SAG_GAIN * (cur_frac * cur_frac)
-                cur_frac = clamp((iout - 8.0) / 10.0, 0.0, 1.0)
-                dv_allow = dv_base * SAG_GAIN * (cur_frac * cur_frac)
-                
-
-                dv_allow = clamp(dv_allow, 0.0, dv_base)     # sanity: 0..dv_base
-                T_LOW = T_HIGH - dv_allow                    # sanity: T_LOW in [T_LOW_BASE..T_HIGH]
-
-                # -------------------------------------------------------------------------------------------------
-                # CLASSIFICATION FLAGS (single place for understandability + future tweaking)
-                # -------------------------------------------------------------------------------------------------
-                # These names are used everywhere below so behavior can be adjusted by tweaking this block, not by
-                # editing many scattered compound conditions.
-                is_soaking = bool(is_v_limited and (iout < FULL_I)) # CONST V or BATT F and low current
-                is_high_current = bool(iout >= SAG_DISABLE_I)
+                # Classification flags.
+                is_soaking = bool(is_v_limited and (iout < FULL_I))
+                is_high_current = bool(iout >= HIGH_CURRENT_I)
                 is_max_r = bool(not is_v_limited)
 
-                # Status is derived from the same flags we actually use for decisions below (keeps logs consistent).
                 if is_soaking:
                     status_now = STATE_BATT_FULL
                 elif is_v_limited:
@@ -679,53 +668,52 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                     return
 
                 # -------------------------------------------------------------------------------------------------
-                # SAG MODE ENABLE
+                # COMPUTE CURRENT TARGET FROM BASE + OFFSET
                 # -------------------------------------------------------------------------------------------------
-                # - SAG mode is allowed only when current is high (>= SAG_DISABLE_I) AND we are in MAX R.
-                # - When SAG mode is disabled, target_vin MUST be fixed at T_HIGH (user target).
-                sag_mode_allowed = is_high_current and is_max_r
+                target_vin = _quant_volts(T_USER + hcc_offset_v)
 
                 # -------------------------------------------------------------------------------------------------
-                # TARGET_vin UPDATE (SAG MODE)
+                # HCC EPISODE DETECTION (edge-triggered)
                 # -------------------------------------------------------------------------------------------------
-                vout_drop = 0.0
-                vout_ref = outv_prev if outv_prev is not None else outv  # logged as "vout_ref"
+                hcc_now = bool(vin < (target_vin - HARD_DROP))
 
-                now_t = time.time()
-                dt_target = now_t - last_target_t
-                if dt_target < 0.0:
-                    dt_target = 0.0
-                last_target_t = now_t
+                if hcc_now and (not in_hcc):
+                    # Entering a new HCC episode (one fall off the cliff).
+                    in_hcc = True
+                    last_no_hcc_t = time.time()  # reset quiet timer on episode start
 
-                if sag_mode_allowed:
-                    # Default to the lower target for efficiency.
-                    if target_vin > T_HIGH:
-                        target_vin = float(T_HIGH)
-                    if target_vin < T_LOW:
-                        target_vin = float(T_LOW)
-
-                    # Detect instantaneous VOUT drop (load step) and push target upward toward T_HIGH.
-                    if outv_prev is not None:
-                        vout_drop = outv_prev - outv
-                        if vout_drop < 0.0:
-                            vout_drop = 0.0
-
-                    if vout_drop > SAG_THRESH:
-                        excess = vout_drop - SAG_THRESH
-                        target_vin = clamp(T_LOW + (SAG_K * excess), T_LOW, T_HIGH)
+                    if first_hcc_ignored:
+                        hcc_offset_v = clamp(hcc_offset_v + HCC_STEP_V, HCC_OFFSET_MIN_V, HCC_OFFSET_MAX_V)
                     else:
-                        # No sag: relax back down toward T_LOW slowly.
-                        target_vin = max(T_LOW, target_vin - (TARGET_RELAX_V_PER_S * dt_target))
-                else:
-                    # SAG disabled: fixed target at the user setting (per your spec).
-                    target_vin = float(T_HIGH)
+                        first_hcc_ignored = True  # ignore the first episode only (startup normalization)
 
-                target_vin = _quant_volts(target_vin)
+                    # Recompute target after offset bump (so prints and subsequent logic match).
+                    target_vin = _quant_volts(T_USER + hcc_offset_v)
 
-                # Update prev OUTV at the end so it truly represents the prior sample.
-                outv_prev = outv
+                if (not hcc_now) and in_hcc:
+                    # Exited the HCC episode.
+                    in_hcc = False
+                    last_no_hcc_t = time.time()  # start quiet timer once we're back out
 
-                # Defaults for "current in use" logging.
+                # -------------------------------------------------------------------------------------------------
+                # STABLE "PROBE DOWN" (bidirectional behavior)
+                # -------------------------------------------------------------------------------------------------
+                # Only probe down when:
+                # - we're NOT currently in an HCC episode
+                # - quiet timer has elapsed
+                # - VIN is tracking close enough to target (stability guard)
+                #
+                # This slowly walks target down (more aggressive) until an HCC pushes it back up.
+                now_t0 = time.time()
+                if (not in_hcc) and ((now_t0 - last_no_hcc_t) >= HCC_QUIET_S):
+                    if vin >= (target_vin - HCC_DECAY_STABLE_EPS):
+                        hcc_offset_v = clamp(hcc_offset_v - HCC_STEP_V, HCC_OFFSET_MIN_V, HCC_OFFSET_MAX_V)
+                        last_no_hcc_t = now_t0
+                        target_vin = _quant_volts(T_USER + hcc_offset_v)
+
+                # -------------------------------------------------------------------------------------------------
+                # CONTROL ERROR (VIN relative to target)
+                # -------------------------------------------------------------------------------------------------
                 band = ""
                 step_used = 0.0
                 new_iset = float(iset_cmd)
@@ -733,13 +721,14 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                 err_vin = vin - target_vin
                 abs_err_vin = -err_vin if err_vin < 0.0 else err_vin
 
-                if vin < (target_vin - HARD_DROP):
+                if hcc_now:
                     # -------------------------------------------------------------------------------------------------
                     # HARD CLOUD COLLAPSE:
                     # -------------------------------------------------------------------------------------------------
+                    # Emergency current backoff only. Offset bump is handled on episode ENTRY above.
                     band = "FAST"
                     step_used = 0.0
-                    # new_iset = _quant_amps(clamp(iset * 0.7, I_MIN, I_MAX))
+
                     new_iset = _quant_amps(clamp(iset_cmd * 0.7, I_MIN, I_MAX))
 
                     try:
@@ -751,7 +740,7 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                         continue
 
                     print(
-                        f"FAST RECOVER TGT={target_vin:5.2f}  "
+                        f"FAST RECOVER TGT={target_vin:5.2f}  HCC={hcc_offset_v:+0.2f}  "
                         f"IOUT={iout:5.2f}A  "
                         f"PWR={pout:5.1f}W  "
                         f"VIN={vin:5.2f}  ISET {iset_cmd:5.2f}->{new_iset:5.2f}  "
@@ -762,10 +751,6 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                     # -------------------------------------------------------------------------------------------------
                     # NORMAL CONTROL
                     # -------------------------------------------------------------------------------------------------
-                    # We ALWAYS regulate VIN (even in CONST V / BATT FULL) so that when we slip back into MAX R,
-                    # we are already near the correct ISET and naturally in FINE/NEAR steps.
-                    #
-                    # The only thing we DO NOT do in CONST V / BATT FULL is VOUT-drop sag detection (handled above).
                     if abs_err_vin > V4:
                         step_up = HUGE_STEP_UP
                         step_dn = HUGE_STEP_DN
@@ -787,13 +772,6 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                         step_dn = FINE_STEP_DN
                         band = "FINE"
 
-                    # Gentle behavior only near the top end (battery full / in CONST V and low current).  # top-end only
-                    # Low current alone is NOT enough, because low current can also mean weak sun with an empty battery.  # avoid bottom-end slowdown
-                    # if is_soaking:
-                    #     step_up = FINE_STEP_UP
-                    #     step_dn = FINE_STEP_DN
-                    #     band = "FINE"
-
                     step_up = _quant_amps(step_up)
                     step_dn = _quant_amps(step_dn)
 
@@ -809,7 +787,7 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
 
                     new_iset = _quant_amps(clamp(new_iset, I_MIN, I_MAX))
 
-                    # Never command much more than what is actually flowing (+ margin).
+                    # Never command much more than what is actually flowing (+ margin) when voltage-limited.
                     if new_iset > iceil and is_v_limited:
                         new_iset = iceil
                         step_used = 9.99
@@ -823,8 +801,7 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                             time.sleep(0.5)
                             continue
 
-                    # VSET DROP/RESTORE FEATURE
-                    # Keep this gated away from the low-current / near-full region to avoid needless flapping.
+                    # VSET DROP/RESTORE FEATURE (unchanged logic, still current-gated)
                     if not is_high_current:
                         if is_soaking:
                             if not vset_reduced:
@@ -847,10 +824,7 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                             else:
                                 vset_base = vset
 
-                    # Show when sag target bump is active without spamming extra lines.
-                    sag_tag = ""
-                    if sag_mode_allowed and (vout_drop > SAG_THRESH):
-                        sag_tag = f" SAG={vout_drop:0.2f}V TGT={target_vin:0.2f}"
+                    hcc_tag = f" HCC={hcc_offset_v:+0.2f}"
 
                     print(
                         f"VSET={vset:5.2f}V "
@@ -863,7 +837,7 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                         f"{step_used:+5.2f}  "
                         f"{'[' + band + ']' if is_v_limited else ' ' + band + ' '}  "
                         f"{status_now}"
-                        f"{sag_tag}"
+                        f"{hcc_tag}"
                     )
 
                 # -------------------------------------------------------------------------------------------------
@@ -887,10 +861,8 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                 time.sleep(LOOP_DELAY)
 
         except KeyboardInterrupt:
-            # Ctrl-C: normal exit path; restore below in finally.
             return
         finally:
-            # Restore RIDEN values.
             _mppt_exit(ser, slave)
 
 
