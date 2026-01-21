@@ -495,7 +495,7 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
     HCC_STEP_V = 0.10              # volts per adjustment; smaller = slower/smoother knee search
     HCC_OFFSET_MIN_V = -2.00       # max aggressive drift (T_USER - 2V); limits how close to knee we probe
     HCC_OFFSET_MAX_V =  2.00       # max conservative drift (T_USER + 2V); limits how far we back off
-    HCC_QUIET_S = 60.0             # seconds with no HCC events before drifting more aggressive
+    HCC_QUIET_S = 90.0             # seconds with no HCC events before drifting more aggressive
     HCC_DECAY_STABLE_EPS = 0.50    # VIN must be within this of target before allowing aggressive drift
 
     # -------------------------------------------------------------------------------------------------
@@ -510,9 +510,9 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
     # -------------------------------------------------------------------------------------------------
     # 5-LEVEL STEP DIVISIONS
     # -------------------------------------------------------------------------------------------------
-    V1 = 0.50  # fine/near boundary
-    V2 = 1.00  # near/mid boundary
-    V3 = 1.50  # mid/far boundary
+    V1 = 0.30  # fine/near boundary
+    V2 = 0.80  # near/mid boundary
+    V3 = 1.20  # mid/far boundary
     V4 = 2.00  # far/huge boundary
 
     HUGE_STEP_UP = 1.75
@@ -588,7 +588,7 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
             # HCC offset state.
             hcc_offset_v = 0.0
             last_no_hcc_t = time.time()  # time anchor for "quiet" stability probe-down
-            in_hcc = False               # True while VIN is in "HCC zone"
+            doing_hcc = False               # True while VIN is in "HCC zone"
             first_hcc_ignored = False    # ignore the first HCC episode only
 
             # Track exit time to enable brief post-HCC acceleration.
@@ -663,18 +663,30 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                     return
 
                 # -------------------------------------------------------------------------------------------------
-                # COMPUTE CURRENT TARGET FROM BASE + OFFSET
+                # COMPUTE CURRENT TARGET FROM BASE + OFFSET WHEN NOT V LIMITED
                 # -------------------------------------------------------------------------------------------------
-                target_vin = _quant_volts(T_USER + hcc_offset_v)
+                # IMPORTANT:
+                # - We do NOT drift/adjust hcc_offset_v while in CONST V.
+                # - While v-limited, we keep showing the last target_vin, but HCC drift logic is frozen.
+                if not is_v_limited:
+                    target_vin = _quant_volts(T_USER + hcc_offset_v)
+                else:
+                    last_no_hcc_t = time.time()  # keep HCC quiet timer fresh during CONST V
 
                 # -------------------------------------------------------------------------------------------------
-                # HCC EPISODE DETECTION (edge-triggered)
+                # HCC (HARD CLOUD COLLAPSE) EPISODE DETECTION (edge-triggered)
                 # -------------------------------------------------------------------------------------------------
-                hcc_now = bool(vin < (target_vin - HARD_DROP))
+                # IMPORTANT:
+                # - Disable HCC episode detection while in CONST V, because we are no longer controlling VIN.
+                # - This prevents hcc_offset_v from drifting while voltage-limited.
+                if not is_v_limited:
+                    hcc_trigger = bool(vin < (target_vin - HARD_DROP))
+                else:
+                    hcc_trigger = False
 
-                if hcc_now and (not in_hcc):
+                if hcc_trigger and (not doing_hcc):
                     # Entering a new HCC episode (one fall off the cliff).
-                    in_hcc = True
+                    doing_hcc = True
                     last_no_hcc_t = time.time()  # reset quiet timer on episode start
 
                     if first_hcc_ignored:
@@ -685,17 +697,19 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                     # Recompute target after offset bump (so prints and subsequent logic match).
                     target_vin = _quant_volts(T_USER + hcc_offset_v)
 
-                if (not hcc_now) and in_hcc:
+                if (not hcc_trigger) and doing_hcc:
                     # Exited the HCC episode.
-                    in_hcc = False
+                    doing_hcc = False
                     last_no_hcc_t = time.time()  # start quiet timer once we're back out
                     last_hcc_exit_t = time.time()
 
                 # -------------------------------------------------------------------------------------------------
                 # STABLE "PROBE DOWN" (bidirectional behavior)
                 # -------------------------------------------------------------------------------------------------
+                # IMPORTANT:
+                # - Freeze probe-down while in CONST V (same reason: we are not controlling VIN there).
                 now_t0 = time.time()
-                if (not in_hcc) and ((now_t0 - last_no_hcc_t) >= HCC_QUIET_S):
+                if (not is_v_limited) and (not doing_hcc) and ((now_t0 - last_no_hcc_t) >= HCC_QUIET_S):
                     if vin >= (target_vin - HCC_DECAY_STABLE_EPS):
                         hcc_offset_v = clamp(hcc_offset_v - HCC_STEP_V, HCC_OFFSET_MIN_V, HCC_OFFSET_MAX_V)
                         last_no_hcc_t = now_t0
@@ -711,7 +725,7 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                 err_vin = vin - target_vin
                 abs_err_vin = -err_vin if err_vin < 0.0 else err_vin
 
-                if hcc_now:
+                if hcc_trigger:
                     # -------------------------------------------------------------------------------------------------
                     # HARD CLOUD COLLAPSE:
                     # -------------------------------------------------------------------------------------------------
@@ -819,7 +833,9 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                             else:
                                 vset_base = vset
 
-                    hcc_tag = f" HCC={hcc_offset_v:+0.2f}"
+                    hcc_tag = ""
+                    if not is_v_limited:
+                        hcc_tag = f" HCC={hcc_offset_v:+0.2f}"
 
                     print(
                         f"VSET={vset:5.2f}V "
