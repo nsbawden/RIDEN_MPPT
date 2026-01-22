@@ -506,14 +506,15 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
     RECOVERY_WINDOW_S = 6.0   # accelerate only briefly after leaving HCC
     RECOVERY_ERR_V = 1.50     # only when VIN is > target + this
     RECOVERY_GAIN = 2.0       # multiply step_up by this during recovery window (bounded below)
+    RECOVERY_MIN_POUT_W = 100.0  # only allow boosted recovery when PV is actually delivering power
 
     # -------------------------------------------------------------------------------------------------
     # 5-LEVEL STEP DIVISIONS
     # -------------------------------------------------------------------------------------------------
-    V1 = 0.30  # fine/near boundary
-    V2 = 0.80  # near/mid boundary
-    V3 = 1.20  # mid/far boundary
-    V4 = 2.00  # far/huge boundary
+    V1 = 0.25  # fine/near boundary
+    V2 = 0.50  # near/mid boundary
+    V3 = 1.00  # mid/far boundary
+    V4 = 1.50  # far/huge boundary
 
     HUGE_STEP_UP = 1.75
     HUGE_STEP_DN = 1.75
@@ -743,10 +744,10 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                         continue
 
                     print(
-                        f"FAST RECOVER TGT={target_vin:5.2f}  HCC={hcc_offset_v:+0.2f}  "
-                        f"IOUT={iout:5.2f}A  "
-                        f"PWR={pout:5.1f}W  "
-                        f"VIN={vin:5.2f}  ISET {iset_cmd:5.2f}->{new_iset:5.2f}  "
+                        f"FAST RECOVER TGT={target_vin:5.2f} HCC={hcc_offset_v:+0.2f} "
+                        f"IOUT={iout:5.2f}A "
+                        f"PWR={pout:5.1f}W "
+                        f"VIN={vin:5.2f} ISET {iset_cmd:5.2f}->{new_iset:5.2f} "
                         f"{status_now}"
                     )
 
@@ -778,8 +779,8 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
                     # SAFE post-HCC acceleration (still monotonic; no jumps)
                     # Only for a short window after leaving HCC, and only when VIN is well above target.
                     if (time.time() - last_hcc_exit_t) <= RECOVERY_WINDOW_S:
-                        if err_vin > RECOVERY_ERR_V:
-                            step_up = min(step_up * RECOVERY_GAIN, HUGE_STEP_UP)  # cap at HUGE_STEP_UP
+                        if (err_vin > RECOVERY_ERR_V) and (pout >= RECOVERY_MIN_POUT_W):
+                            step_up = min(step_up * RECOVERY_GAIN, HUGE_STEP_UP)
 
                     step_up = _quant_amps(step_up)
                     step_dn = _quant_amps(step_dn)
@@ -839,14 +840,13 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
 
                     print(
                         f"VSET={vset:5.2f}V "
-                        f"VOUT={outv:5.2f}V "
-                        f"IOUT={iout:5.2f}A  | "
-                        f"PWR={pout:5.1f}W  "
-                        f"VIN={vin:5.2f}  "
-                        f"TGT={target_vin:5.2f}  "
-                        f"ISET={iset_cmd:5.2f}  "
-                        f"{step_used:+5.2f}  "
-                        f"{'[' + band + ']' if is_v_limited else ' ' + band + ' '}  "
+                        f"OUT {outv:5.2f}V {iout:5.2f}A | "
+                        f"PWR={pout:5.1f}W "
+                        f"VIN={vin:5.2f} "
+                        f"TGT={target_vin:5.2f} "
+                        f"ISET={iset_cmd:5.2f} "
+                        f"{step_used:+5.2f} "
+                        f"{'[' + band + ']' if is_v_limited else ' ' + band + ' '} "
                         f"{status_now}"
                         f"{hcc_tag}"
                     )
