@@ -516,8 +516,8 @@ def mppt_loop(vtarget: float, port: str, slave: int, background_mode: bool) -> N
     V3 = 1.00  # mid/far boundary
     V4 = 1.50  # far/huge boundary
 
-    HUGE_STEP_UP = 1.75
-    HUGE_STEP_DN = 1.75
+    HUGE_STEP_UP = 0.80
+    HUGE_STEP_DN = 0.80
     FAR_STEP_UP = 0.20
     FAR_STEP_DN = 0.20
     MID_STEP_UP = 0.10
